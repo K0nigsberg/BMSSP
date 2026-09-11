@@ -48,15 +48,24 @@ routing / tie buckets.
 ### Queues
 
 - `PartialQueue`: `BTreeMap` by exact key; Pull = one smallest key-bucket.
-- `BlockQueue`: Lemma 3.3-style blocks of size `M = 2^((l-1)t)`; Pull = `M`
-  smallest values with ties taken whole. BatchPrepend is ordinary insert (no
-  separate `D₀` front list).
+- `BlockQueue`: Lemma 3.3-style blocks of size `M = 2^((l-1)t)`:
+  - **`D₀`**: front `VecDeque` of blocks that only receive BatchPrepend when
+    every new key is strictly below the current live minimum (paper contract).
+    Otherwise falls back to Insert into `D₁` (keeps random fuzz / odd routing safe).
+  - **`D₁`**: BST-keyed blocks for ordinary Insert.
+  - **Decrease-key (lazy):** `best: HashMap` keeps the smallest key per vertex;
+    worse Insert/BatchPrepend is skipped; Pull ignores stale physical copies.
+  - Pull = `M` smallest *live* values with ties taken whole. Selection currently
+    reads `best` and rebuilds leftovers into `D₁` (correct; paper-style O(|S′|)
+    prefix-of-blocks Pull is the next polish). Insert uses a strict `≥ B_i` cut
+    in `bmssp.rs` (not `B_i - EPS`) so real weights cannot hide keys behind D₀.
 
 ## Documented deviations from the paper
 
 1. Strict-`<` distance updates (lazy heaps + zero-weight safety) instead of ≤
    everywhere; completeness patched by W→queue, touched returns, leftover prepend.
-2. Route every strict improvement (no `cand < B'_i` skip).
+2. Route every strict improvement (no `cand < B'_i` skip); Insert cut is
+   exact `cand >= B_i` (not `B_i - EPS`) for BlockQueue D₀/D₁ safety.
 3. BaseCase returns boundary + still-in-heap, not paper `U = {v : d̂ < B'}`.
 4. Depth-stamped U membership (not a shared epoch array) across recursion.
 5. Constant-degree transform is **out-degree only** (`transform.rs`).

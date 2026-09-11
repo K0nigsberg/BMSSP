@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 /// Total-order wrapper for f64 keys (no NaN; `total_cmp` gives a total order).
 #[derive(Debug, Clone, Copy)]
@@ -159,15 +159,16 @@ fn split_block(mut blk: Block) -> (Block, Block) {
 /// Block-based partial-order queue (Lemma 3.3).
 ///
 /// - `D0` (`d0`): prepend-only front blocks for BatchPrepend when every new key
-///   is strictly below the current live minimum (paper contract).
+///   is strictly below the current physical minimum (paper contract).
 /// - `D1` (`blocks`): BST-keyed blocks for ordinary Insert.
-/// - `best`: lazy decrease-key — keep the smallest key per vertex; skip worse
-///   Insert/BatchPrepend; Pull ignores stale physical copies.
 ///
-/// Pull always drains D0 completely before reading D1, then parks leftovers in
-/// D1 only. That keeps "D0 before D1" aligned with value order even after
-/// BatchPrepend + Insert under real-weight EPS noise. If BatchPrepend breaks
-/// the contract, we flush D0 into D1 and Insert (safe fallback).
+/// Vertices may appear at several keys (lazy Dijkstra-style). We deliberately
+/// do **not** decrease-key / drop the prior entry when a better key arrives:
+/// BMSSP can still need the older, larger key as a retry under a wider child
+/// bound (see Codex review on PR #6).
+///
+/// Pull drains D0 completely before reading D1, then parks leftovers in D1.
+/// If BatchPrepend breaks the "< min" contract, flush D0 into D1 and Insert.
 #[derive(Debug)]
 pub struct BlockQueue {
     d0: VecDeque<Block>,
@@ -175,10 +176,8 @@ pub struct BlockQueue {
     bound: f64,
     m: usize,
     seq: u64,
-    best: HashMap<u32, f64>,
     pub d0_fast_path: u64,
     pub d0_fallback: u64,
-    pub decrease_key_skipped: u64,
 }
 
 impl BlockQueue {
@@ -189,53 +188,46 @@ impl BlockQueue {
             bound,
             m: m.max(1),
             seq: 0,
-            best: HashMap::new(),
             d0_fast_path: 0,
             d0_fallback: 0,
-            decrease_key_skipped: 0,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.best.is_empty()
+        self.d0.is_empty() && self.blocks.is_empty()
     }
 
-    pub fn live_len(&self) -> usize {
-        self.best.len()
+    fn item_count(&self) -> usize {
+        self.d0.iter().map(|b| b.items.len()).sum::<usize>()
+            + self.blocks.values().map(|b| b.items.len()).sum::<usize>()
     }
 
-    fn note_key(&mut self, v: u32, key: f64) -> bool {
-        if let Some(&prev) = self.best.get(&v) {
-            if prev <= key {
-                self.decrease_key_skipped += 1;
-                return false;
-            }
-        }
-        self.best.insert(v, key);
-        true
-    }
-
-    fn is_live(&self, v: u32, key: f64) -> bool {
-        self.best
-            .get(&v)
-            .is_some_and(|&b| b.to_bits() == key.to_bits())
-    }
-
-    fn d0_min_live(&self) -> Option<f64> {
+    fn d0_min(&self) -> Option<f64> {
         self.d0
             .iter()
-            .flat_map(|b| b.items.iter())
-            .filter(|(v, k)| self.is_live(*v, *k))
-            .map(|(_, k)| *k)
+            .flat_map(|b| b.items.iter().map(|it| it.1))
             .min_by(|a, b| a.total_cmp(b))
+    }
+
+    fn physical_min(&self) -> Option<f64> {
+        let d0 = self.d0_min();
+        let d1 = self
+            .blocks
+            .values()
+            .flat_map(|b| b.items.iter().map(|it| it.1))
+            .min_by(|a, b| a.total_cmp(b));
+        match (d0, d1) {
+            (Some(a), Some(b)) => Some(if a < b { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     pub fn insert(&mut self, v: u32, key: f64) {
         debug_assert!(key.is_finite());
-        if !self.note_key(v, key) {
-            return;
-        }
-        if let Some(d0_min) = self.d0_min_live() {
+        // Keep D0 <= D1: keys below the D0 minimum belong on D0.
+        if let Some(d0_min) = self.d0_min() {
             if key < d0_min {
                 self.prepend_d0(vec![(v, key)]);
                 return;
@@ -365,36 +357,23 @@ impl BlockQueue {
         if items.is_empty() {
             return;
         }
-        let min_existing = self
-            .best
-            .values()
-            .copied()
-            .min_by(|a, b| a.total_cmp(b));
-
-        let mut filtered: Vec<(u32, f64)> = Vec::with_capacity(items.len());
-        for &(v, k) in items {
+        for &(_, k) in items {
             debug_assert!(k.is_finite());
-            if !self.note_key(v, k) {
-                continue;
-            }
-            filtered.push((v, k));
-        }
-        if filtered.is_empty() {
-            return;
         }
 
-        let max_batch = filtered
+        let max_batch = items
             .iter()
             .map(|it| it.1)
             .fold(f64::NEG_INFINITY, f64::max);
+        let min_existing = self.physical_min();
 
         if min_existing.map(|mn| max_batch < mn).unwrap_or(true) {
             self.d0_fast_path += 1;
-            self.prepend_d0(filtered);
+            self.prepend_d0(items.to_vec());
         } else {
             self.d0_fallback += 1;
             self.flush_d0_into_d1();
-            for (v, k) in filtered {
+            for &(v, k) in items {
                 self.insert_d1(v, k);
             }
         }
@@ -403,9 +382,7 @@ impl BlockQueue {
     fn flush_d0_into_d1(&mut self) {
         while let Some(blk) = self.d0.pop_front() {
             for (v, k) in blk.items {
-                if self.is_live(v, k) {
-                    self.insert_d1(v, k);
-                }
+                self.insert_d1(v, k);
             }
         }
     }
@@ -435,46 +412,35 @@ impl BlockQueue {
     }
 
     pub fn pull(&mut self) -> (Vec<u32>, f64) {
-        if self.best.is_empty() {
-            self.d0.clear();
-            self.blocks.clear();
+        if self.is_empty() {
             return (Vec::new(), self.bound);
         }
 
-        // Authoritative selection from the live set. Physical D0/D1 storage is
-        // compacted around leftovers afterward. BatchPrepend still benefits
-        // from the D0 fast path between pulls; restoring paper-style O(|S'|)
-        // prefix Pull is a follow-up.
-        let mut live: Vec<(u32, f64)> = self.best.iter().map(|(&v, &k)| (v, k)).collect();
-        live.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        self.d0.clear();
-        self.blocks.clear();
-        self.select_and_rebuild(live, self.m)
-    }
+        // Materialize every physical entry. Prefix-of-blocks Pull is a follow-up;
+        // D0 still accelerates BatchPrepend between pulls. Multi-entry (no
+        // decrease-key) semantics are load-bearing for BMSSP retries.
+        let mut collected: Vec<(u32, f64)> = Vec::with_capacity(self.item_count());
+        for blk in self.d0.drain(..) {
+            collected.extend(blk.items);
+        }
+        for (_, blk) in std::mem::take(&mut self.blocks) {
+            collected.extend(blk.items);
+        }
 
-    fn select_and_rebuild(&mut self, deduped: Vec<(u32, f64)>, m: usize) -> (Vec<u32>, f64) {
-        if deduped.is_empty() {
-            return (Vec::new(), self.bound);
-        }
-        if deduped.len() <= m {
-            for &(v, _) in &deduped {
-                self.best.remove(&v);
-            }
-            let vs = deduped.iter().map(|&(v, _)| v).collect();
-            return (vs, self.min_value_live().unwrap_or(self.bound));
-        }
-        let vm = deduped[m - 1].1;
-        let take = deduped.partition_point(|it| it.1 <= vm);
-        let s: Vec<u32> = deduped[..take].iter().map(|&(v, _)| v).collect();
-        for &v in &s {
-            self.best.remove(&v);
-        }
-        self.rebuild_blocks(&deduped[take..]);
-        (s, self.min_value_live().unwrap_or(self.bound))
-    }
+        collected.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-    fn min_value_live(&self) -> Option<f64> {
-        self.best.values().copied().min_by(|a, b| a.total_cmp(b))
+        let m = self.m;
+        if collected.len() <= m {
+            let vs = collected.iter().map(|&(v, _)| v).collect();
+            return (vs, self.bound);
+        }
+
+        let vm = collected[m - 1].1;
+        let take = collected.partition_point(|it| it.1 <= vm);
+        let s: Vec<u32> = collected[..take].iter().map(|&(v, _)| v).collect();
+        self.rebuild_blocks(&collected[take..]);
+        let x = self.physical_min().unwrap_or(self.bound);
+        (s, x)
     }
 
     fn rebuild_blocks(&mut self, items: &[(u32, f64)]) {
@@ -498,16 +464,17 @@ impl BlockQueue {
     }
 
     pub fn drain(&mut self) -> Vec<(u32, f64)> {
-        let mut out: Vec<(u32, f64)> = self.best.iter().map(|(&v, &k)| (v, k)).collect();
-        out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        self.d0.clear();
-        self.blocks.clear();
-        self.best.clear();
+        let mut out = Vec::new();
+        for blk in self.d0.drain(..) {
+            out.extend(blk.items);
+        }
+        for (_, blk) in std::mem::take(&mut self.blocks) {
+            out.extend(blk.items);
+        }
         out
     }
 }
 
-/// Uniform interface used by the BMSSP engine for both queue backends.
 pub enum QueueOps {
     Map(PartialQueue),
     Block(BlockQueue),
@@ -625,17 +592,15 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_decrease_key_keeps_best() {
+    fn block_queue_keeps_prior_key_when_improved() {
+        // Codex P1: improving a key must not erase the prior queue entry.
         let mut q = BlockQueue::new(100.0, 4);
-        q.insert(1, 9.0);
-        q.insert(1, 9.0);
-        assert_eq!(q.decrease_key_skipped, 1);
-        q.insert(1, 3.0);
-        q.insert(1, 5.0);
-        assert_eq!(q.live_len(), 1);
-        let (b, bi) = q.pull();
-        assert_eq!(b, vec![1]);
-        assert_eq!(bi, 100.0);
+        q.insert(2, 0.07);
+        q.insert(2, 0.06);
+        assert_eq!(q.item_count(), 2);
+        let (b, _) = q.pull();
+        // m=4 > 2, both entries returned (lazy multi-entry semantics).
+        assert_eq!(b, vec![2, 2]);
         assert!(q.is_empty());
     }
 
@@ -651,6 +616,8 @@ mod tests {
         assert_eq!(b, vec![1, 2]);
     }
 
+    /// Model-based differential test: BlockQueue vs a sorted-vector multiset
+    /// (duplicate vertex keys allowed — no decrease-key).
     #[test]
     fn block_queue_matches_model() {
         use rand::Rng;
@@ -660,7 +627,7 @@ mod tests {
         for &m in &[1usize, 2, 3, 8] {
             for bound in [50.0f64, 1000.0] {
                 let mut q = BlockQueue::new(bound, m);
-                let mut model: HashMap<u32, f64> = HashMap::new();
+                let mut model: Vec<(u32, f64)> = Vec::new();
                 let mut log: Vec<String> = Vec::new();
                 for _ in 0..4000 {
                     match rng.gen_range(0..4u32) {
@@ -668,7 +635,7 @@ mod tests {
                             let v = rng.gen_range(0..12u32);
                             let k = (rng.gen_range(0..40) as f64) * 0.25;
                             q.insert(v, k);
-                            model_insert(&mut model, v, k);
+                            model.push((v, k));
                             log.push(format!("I {v} {k}"));
                         }
                         1 => {
@@ -681,14 +648,11 @@ mod tests {
                                 })
                                 .collect();
                             q.batch_prepend(&items);
-                            for &(v, k) in &items {
-                                model_insert(&mut model, v, k);
-                            }
+                            model.extend_from_slice(&items);
                             log.push(format!("B {items:?}"));
                         }
                         2 => {
-                            let m_pre: Vec<(u32, f64)> =
-                                model.iter().map(|(&v, &k)| (v, k)).collect();
+                            let m_pre = model.clone();
                             let (sb, xb) = q.pull();
                             let (sm, xm) = model_pull(&mut model, m, bound);
                             let mut sb = sb;
@@ -696,15 +660,12 @@ mod tests {
                             let mut sm = sm;
                             sm.sort_unstable();
                             assert_eq!(
-                                sb, sm,
+                                sb,
+                                sm,
                                 "bucket mismatch m={m}\nmodel_pre={m_pre:?}\nops={}",
                                 log.join(" ")
                             );
-                            assert_eq!(
-                                xb, xm,
-                                "separation mismatch m={m}\nops={}",
-                                log.join(" ")
-                            );
+                            assert_eq!(xb, xm, "separation mismatch m={m}\nops={}", log.join(" "));
                             assert_eq!(q.is_empty(), model.is_empty());
                             log.push(format!("P {:?}", sm));
                         }
@@ -713,9 +674,9 @@ mod tests {
                         }
                     }
                     assert_eq!(
-                        q.live_len(),
+                        q.item_count(),
                         model.len(),
-                        "live count mismatch m={m}\nops={}",
+                        "item count mismatch m={m}\nops={}",
                         log.join(" ")
                     );
                 }
@@ -723,34 +684,18 @@ mod tests {
         }
     }
 
-    fn model_insert(model: &mut HashMap<u32, f64>, v: u32, k: f64) {
-        match model.get(&v) {
-            Some(&prev) if prev <= k => {}
-            _ => {
-                model.insert(v, k);
-            }
-        }
-    }
-
-    fn model_pull(model: &mut HashMap<u32, f64>, m: usize, bound: f64) -> (Vec<u32>, f64) {
-        let mut items: Vec<(u32, f64)> = model.iter().map(|(&v, &k)| (v, k)).collect();
+    fn model_pull(items: &mut Vec<(u32, f64)>, m: usize, bound: f64) -> (Vec<u32>, f64) {
         items.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         if items.len() <= m {
             let vs = items.iter().map(|&(v, _)| v).collect();
-            model.clear();
+            items.clear();
             return (vs, bound);
         }
         let vm = items[m - 1].1;
         let take = items.partition_point(|it| it.1 <= vm);
         let s: Vec<u32> = items[..take].iter().map(|&(v, _)| v).collect();
-        for &v in &s {
-            model.remove(&v);
-        }
-        let x = items[take..]
-            .iter()
-            .map(|it| it.1)
-            .min_by(|a, b| a.total_cmp(b))
-            .unwrap_or(bound);
+        items.drain(..take);
+        let x = if items.is_empty() { bound } else { items[0].1 };
         (s, x)
     }
 }

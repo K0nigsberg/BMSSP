@@ -189,9 +189,10 @@ CI (`.github/workflows/ci.yml`): `fmt` + `clippy -D warnings` + `cargo test --lo
 
 Ordered by expected payoff for *this* Rust crate, given what peers already did:
 
-1. ~~**True `D₀` BatchPrepend + decrease-key**~~ — **done (2026-09-11).**
-   `BlockQueue` now has a real `D₀` front list (fast path when prepends sit
-   below the live min) plus lazy decrease-key via `best`. See `ALGORITHM.md`.
+1. ~~**True `D₀` BatchPrepend**~~ — **done (2026-09-11).**
+   `BlockQueue` has a real `D₀` front list (fast path when prepends sit below
+   the physical min). Decrease-key was tried and **reverted**: BMSSP needs
+   prior larger keys as retries (Codex P1 on PR #6). See `ALGORITHM.md`.
 2. **`t` / `k` parameter sweep** — novel data point almost nobody publishes;
    wire into `bench_sssp` / `BmsspConfig`.
 3. **Multi-source microbench** — BMSSP’s real API is bounded *multi*-source;

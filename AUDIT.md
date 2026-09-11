@@ -35,7 +35,8 @@ invariants the test suite is meant to protect.
 | 4 | Shared `marked_u` epoch clobber | Spurious top halt, lost verts | Depth-stamped U (then arena) |
 | 4 | Halt at `\|U\| ≥ limit` when limit=`n` | Top-level `B'<<∞` | Keep `\|U\| > limit` |
 | 5 | Zero-weight pivot forest cycles | Wrong/`P=S` pivots | W-order parents only |
-| 6 | D₀ leftovers + `cand >= B_i - EPS` Insert | Real-weight `er_c4_real` wrong dists under block+partial | Strict `cand >= B_i`; Pull from live `best`; D₀ drain / D₁ leftovers |
+| 6 | D₀ leftovers + `cand >= B_i - EPS` Insert | Real-weight `er_c4_real` wrong dists under block+partial | Strict `cand >= B_i`; D₀ flush fallback |
+| 6 | Decrease-key dropped prior larger queue keys | BMSSP missed retries under wider child `B_i` (Codex P1) | Keep multi-entry lazy keys; no decrease-key |
 
 ## Test map
 

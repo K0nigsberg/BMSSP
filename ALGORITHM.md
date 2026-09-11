@@ -53,12 +53,13 @@ routing / tie buckets.
     every new key is strictly below the current live minimum (paper contract).
     Otherwise falls back to Insert into `D₁` (keeps random fuzz / odd routing safe).
   - **`D₁`**: BST-keyed blocks for ordinary Insert.
-  - **Decrease-key (lazy):** `best: HashMap` keeps the smallest key per vertex;
-    worse Insert/BatchPrepend is skipped; Pull ignores stale physical copies.
-  - Pull = `M` smallest *live* values with ties taken whole. Selection currently
-    reads `best` and rebuilds leftovers into `D₁` (correct; paper-style O(|S′|)
-    prefix-of-blocks Pull is the next polish). Insert uses a strict `≥ B_i` cut
-    in `bmssp.rs` (not `B_i - EPS`) so real weights cannot hide keys behind D₀.
+  - **No decrease-key:** a vertex may appear at several keys (lazy Dijkstra-style).
+    Dropping the prior larger key when a better one arrives breaks BMSSP retries
+    under a wider child bound (Codex P1 on PR #6).
+  - Pull = `M` smallest values with ties taken whole. Currently materializes the
+    physical multiset then rebuilds leftovers into `D₁` (correct; paper-style
+    O(|S′|) prefix Pull is next). Insert uses a strict `≥ B_i` cut in `bmssp.rs`
+    (not `B_i - EPS`) so real weights cannot hide keys behind D₀.
 
 ## Documented deviations from the paper
 

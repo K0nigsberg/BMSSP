@@ -222,8 +222,9 @@ impl<'a> BmsspEngine<'a> {
                 self.u_add(&mut u_total, depth, x);
             }
 
-            // Route every strict improvement: [0, B_i) -> batch, [B_i, B) -> insert.
-            // BatchPrepend S_i leftovers with dhat in [B'_i, B_i) (Alg. 3 line 25).
+            // Route every strict improvement: [0, B_i) -> batch, [B_i, B) -> insert
+            // (exact B_i cut; see Insert branch below). BatchPrepend S_i leftovers
+            // with dhat in [B'_i, B_i) (Alg. 3 line 25).
             let mut to_batch = self.take_pairs();
             if bp_i < bi - EPS {
                 for &x in &si {
@@ -246,7 +247,11 @@ impl<'a> BmsspEngine<'a> {
                         if self.trace {
                             eprintln!("R: {u} -> {v} cand={cand} b={b} bi={bi} bp={bp_i}");
                         }
-                        if cand >= bi - EPS {
+                        // Strict `>= B_i` (not `B_i - EPS`): a key in
+                        // `[B_i - EPS, B_i)` must BatchPrepend into D0. Sending
+                        // it through Insert with BlockQueue's D0/D1 split can
+                        // hide it behind larger D0 leftovers under real weights.
+                        if cand >= bi {
                             pq.insert(v, cand);
                             self.counters.queue_insert += 1;
                         } else {

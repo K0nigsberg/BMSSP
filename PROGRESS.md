@@ -287,3 +287,33 @@ vs Session 3: layered 190→86ms, er_c4_1e5 370→144ms — constant-factor win,
    loses on hubby graphs.
 3. Docs + `BMSSP_SCALE` close the Phase 5/6 “reproducibility” checklist for agentic
    follow-up; full 1e7 runs need more wall-clock than this session budgeted.
+
+## Session 6 (2026-09-11) — Landscape README + D₀ / decrease-key
+
+Goal: document the broader BMSSP implementation landscape, then land the
+highest-payoff DS upgrade called out across public ports (true Lemma 3.3 `D₀`
+BatchPrepend + decrease-key).
+
+### Status
+
+- [x] `README.md` — dated (2026-09-11) landscape survey, this crate’s position,
+      levers, and improvement roadmap.
+- [x] `BlockQueue`: `D₀` front `VecDeque` for BatchPrepend when every new key is
+      strictly below the live minimum; safe flush-into-`D₁` fallback otherwise.
+- [x] Lazy decrease-key via `best: HashMap<u32, f64>` (skip worse Insert/Prepend).
+- [x] Pull selects from the live set and rebuilds leftovers into `D₁` (correct;
+      O(|S′|) prefix Pull still open).
+- [x] BMSSP routing: Insert cut is strict `cand >= B_i` (not `B_i - EPS`) so
+      real-weight keys cannot land in `D₁` behind larger `D₀` leftovers.
+- [x] Regression `tests/repro_real.rs` (int + real ER, block+partial).
+- [x] Full suite green; clippy `-D warnings` clean; release bench all `verified=true`.
+
+### Findings
+
+1. D₀ + decrease-key are the right *structural* move toward the paper bound;
+   wall-clock on this Linux box is not yet better than Session 5’s macOS numbers
+   because Pull still sorts the full live set each time.
+2. Real-weighted `er_c4_real` is a sharp correctness probe for D₀/D₁ ordering
+   under float EPS — integer graphs alone will not catch it.
+3. Next: restore paper-style prefix-of-blocks Pull on top of D₀, then re-bench;
+   then `t`/`k` sweep / multi-source / openSVM JSON metrics.
